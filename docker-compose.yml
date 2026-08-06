@@ -1,0 +1,29 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: tomcat_db
+      POSTGRES_USER: tomcat_user
+      POSTGRES_PASSWORD: tomcat_password
+    volumes:
+      - tomcat_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tomcat_user -d tomcat_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    image: tomcat-app:1.0
+    ports:
+      - "8000:8000"
+    environment:
+      APP_NAME: tomcat-app
+      DATABASE_URL: postgresql+asyncpg://tomcat_user:tomcat_password@db:5432/tomcat_db
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  tomcat_postgres_data:
