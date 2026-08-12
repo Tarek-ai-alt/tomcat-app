@@ -1,0 +1,139 @@
+stages:
+  - validate
+  - test
+  - security
+  - build
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  DOCKER_HOST: "tcp://docker:2375"
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_DRIVER: "overlay2"
+  IMAGE_TAG: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+
+cache:
+  key: "$CI_COMMIT_REF_SLUG-pip"
+  paths:
+    - .cache/pip/
+
+# 1) Validate Python dependencies and source syntax.
+validate_app:
+  stage: validate
+  image: python:3.12-slim
+  before_script:
+    - python --version
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+  script:
+    - pip check
+    - python -m compileall -q app
+
+# 2) Start PostgreSQL, launch the FastAPI app, and test real endpoints.
+integration_test:
+  stage: test
+  image: python:3.12-slim
+  services:
+    - name: postgres:17-alpine
+      alias: postgres
+  variables:
+    POSTGRES_DB: "tomcat_db"
+    POSTGRES_USER: "tomcat_user"
+    POSTGRES_PASSWORD: "tomcat_password"
+    DATABASE_URL: "postgresql+asyncpg://tomcat_user:tomcat_password@postgres:5432/tomcat_db"
+  before_script:
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+  script:
+    - |
+      python - <<'PY'
+      import asyncio
+      import asyncpg
+
+      async def wait_for_database():
+          for attempt in range(30):
+              try:
+                  conn = await asyncpg.connect(
+                      host="postgres",
+                      port=5432,
+                      user="tomcat_user",
+                      password="tomcat_password",
+                      database="tomcat_db",
+                  )
+                  await conn.close()
+                  print("PostgreSQL is ready")
+                  return
+              except Exception as exc:
+                  print(f"Waiting for PostgreSQL ({attempt + 1}/30): {exc}")
+                  await asyncio.sleep(2)
+          raise SystemExit("PostgreSQL did not become ready")
+
+      asyncio.run(wait_for_database())
+      PY
+    - gunicorn app.main:app -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --workers 1 > gunicorn.log 2>&1 &
+    - APP_PID=$!
+    - |
+      python - <<'PY'
+      import time
+      import httpx
+
+      for attempt in range(30):
+          try:
+              response = httpx.get("http://127.0.0.1:8000/health", timeout=5)
+              if response.status_code == 200:
+                  print("Health check passed:", response.json())
+                  break
+          except Exception as exc:
+              print(f"Waiting for API ({attempt + 1}/30): {exc}")
+          time.sleep(2)
+      else:
+          raise SystemExit("FastAPI application did not become healthy")
+
+      root = httpx.get("http://127.0.0.1:8000/", timeout=5)
+      products = httpx.get("http://127.0.0.1:8000/api/v1/products", timeout=5)
+      assert root.status_code == 200, root.text
+      assert products.status_code == 200, products.text
+      print("Root endpoint:", root.json())
+      print("Products endpoint:", products.json())
+      PY
+  after_script:
+    - cat gunicorn.log 2>/dev/null || true
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - gunicorn.log
+
+# 3) DevSecOps checks: source-code scan + dependency vulnerability audit.
+security_scan:
+  stage: security
+  image: python:3.12-slim
+  before_script:
+    - pip install --upgrade pip
+    - pip install bandit pip-audit
+  script:
+    - bandit -r app -ll
+    - pip-audit -r requirements.txt
+
+# 4) Build the Docker image and push it to the GitLab Container Registry.
+build_and_push_image:
+  stage: build
+  image: docker:27.5.1-cli
+  services:
+    - name: docker:27.5.1-dind
+      alias: docker
+      command: ["--tls=false"]
+  before_script:
+    - docker info
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - docker build --pull -t "$IMAGE_TAG" .
+    - docker push "$IMAGE_TAG"
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        docker tag "$IMAGE_TAG" "$CI_REGISTRY_IMAGE:latest"
+        docker push "$CI_REGISTRY_IMAGE:latest"
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+    
